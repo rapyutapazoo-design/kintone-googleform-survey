@@ -21,6 +21,8 @@
 // ---- 定数 ----
 var USER_ID_QUESTION_TITLE = 'ユーザーID（変更しないでください）';
 var USER_CODE_PLACEHOLDER = '__USERCODE__';
+var EMAIL_QUESTION_TITLE = 'メールアドレス（控えの送信先・任意）';
+var EMAIL_PLACEHOLDER = '__USEREMAIL__';
 var MASTER_PREFIX = '[マスター]'; // この接頭辞のフォームは登録対象外
 
 // ---- 設定取得 ----
@@ -86,15 +88,17 @@ function registerNewForms(config) {
 function setupForm(config, formId, formName) {
   var form = FormApp.openById(formId);
 
-  // --- フォーム設定（編集不可・メール収集はマスターから引き継ぎ前提で二重担保） ---
+  // --- フォーム設定 ---
   form.setAllowResponseEdits(false);    // 回答後の編集は常に不可
   form.setAcceptingResponses(true);
-  try { form.setCollectEmail(true); } catch (e) {
-    console.warn('[setupForm] メール収集設定に失敗（マスター設定を引き継いでいれば問題なし）: ' + e);
+  // 標準のメール収集は使わない（必須固定・事前入力不可のため）。
+  // 控えメールはonFormSubmitでGASが送信する。
+  try { form.setCollectEmail(false); } catch (e) {
+    console.warn('[setupForm] メール収集オフ設定に失敗: ' + e);
   }
 
   // --- ユーザーID質問の追加（既存チェック付き） ---
-  var userIdItem = findUserIdItem(form);
+  var userIdItem = findItemByTitle(form, USER_ID_QUESTION_TITLE);
   if (!userIdItem) {
     userIdItem = form.addTextItem()
       .setTitle(USER_ID_QUESTION_TITLE)
@@ -102,9 +106,20 @@ function setupForm(config, formId, formName) {
       .setRequired(true);
   }
 
+  // --- 控え送信先メールアドレス質問の追加（任意・既存チェック付き） ---
+  var emailItem = findItemByTitle(form, EMAIL_QUESTION_TITLE);
+  if (!emailItem) {
+    emailItem = form.addTextItem()
+      .setTitle(EMAIL_QUESTION_TITLE)
+      .setHelpText('回答の控えメールが不要な場合は空欄にしてください。'
+        + '控えが見当たらない場合は迷惑メールフォルダをご確認ください。')
+      .setRequired(false);
+  }
+
   // --- 事前入力URL（プレースホルダ入り）の生成 ---
   var formResponse = form.createResponse();
   formResponse.withItemResponse(userIdItem.asTextItem().createResponse(USER_CODE_PLACEHOLDER));
+  formResponse.withItemResponse(emailItem.asTextItem().createResponse(EMAIL_PLACEHOLDER));
   var prefillUrl = formResponse.toPrefilledUrl();
   var entryId = extractEntryId(prefillUrl);
 
@@ -126,11 +141,11 @@ function setupForm(config, formId, formName) {
   });
 }
 
-/** ユーザーID質問を検索 */
-function findUserIdItem(form) {
+/** タイトル一致でテキスト質問を検索 */
+function findItemByTitle(form, title) {
   var items = form.getItems(FormApp.ItemType.TEXT);
   for (var i = 0; i < items.length; i++) {
-    if (items[i].getTitle() === USER_ID_QUESTION_TITLE) return items[i];
+    if (items[i].getTitle() === title) return items[i];
   }
   return null;
 }
@@ -242,18 +257,76 @@ function onFormSubmit(e) {
     // 競合に備えてリトライ付きで追記
     appendAnswerWithRetry(config, record.$id.value, userCode, e.response.getTimestamp());
     console.log('[onFormSubmit] 記録完了: ' + userCode + ' (form=' + formId + ')');
+
+    // 控えメール送信（記録が主・メールが従。失敗しても記録には影響させない）
+    try {
+      sendCopyEmail(form, e.response);
+    } catch (mailErr) {
+      console.error('[onFormSubmit] 控えメール送信失敗: ' + mailErr);
+    }
   } catch (err) {
     // 失敗しても watchFolder の補修同期が5分以内にリカバリする
     console.error('[onFormSubmit] Error: ' + err + '\n' + (err.stack || ''));
   }
 }
 
+/** 回答から指定タイトルのテキスト質問の値を抽出 */
+function extractItemValue(form, formResponse, title) {
+  var item = findItemByTitle(form, title);
+  if (!item) return '';
+  var itemResponse = formResponse.getResponseForItem(item);
+  return itemResponse ? String(itemResponse.getResponse()).trim() : '';
+}
+
 /** 回答からユーザーID質問の値を抽出 */
 function extractUserCode(form, formResponse) {
-  var userIdItem = findUserIdItem(form);
-  if (!userIdItem) return '';
-  var itemResponse = formResponse.getResponseForItem(userIdItem);
-  return itemResponse ? String(itemResponse.getResponse()).trim() : '';
+  return extractItemValue(form, formResponse, USER_ID_QUESTION_TITLE);
+}
+
+// ============================================================
+// 控えメール送信（onFormSubmitから呼び出し）
+// ============================================================
+
+/**
+ * メールアドレス質問に入力があれば、回答の控えメールを送信する。
+ * 送信失敗しても回答記録には影響させない（呼び出し側でtry-catch分離）。
+ */
+function sendCopyEmail(form, formResponse) {
+  var email = extractItemValue(form, formResponse, EMAIL_QUESTION_TITLE);
+  if (!email) return; // 空欄＝控え不要（任意のため）
+  if (email.indexOf('@') === -1) {
+    console.warn('[sendCopyEmail] メールアドレスとして不正なためスキップ: ' + email);
+    return;
+  }
+
+  var lines = [];
+  lines.push('このたびはアンケートにご回答いただき、ありがとうございました。');
+  lines.push('以下があなたの回答の控えです。');
+  lines.push('');
+  lines.push('■ アンケート: ' + form.getTitle());
+  lines.push('■ 回答日時: ' + Utilities.formatDate(
+    formResponse.getTimestamp(), 'Asia/Tokyo', 'yyyy/MM/dd HH:mm'));
+  lines.push('----------------------------------------');
+
+  formResponse.getItemResponses().forEach(function (itemResponse) {
+    var title = itemResponse.getItem().getTitle();
+    // システム用の質問は控えに含めない
+    if (title === USER_ID_QUESTION_TITLE || title === EMAIL_QUESTION_TITLE) return;
+    var answer = itemResponse.getResponse();
+    if (Array.isArray(answer)) answer = answer.join('、');
+    lines.push('【' + title + '】');
+    lines.push(String(answer));
+    lines.push('');
+  });
+
+  lines.push('----------------------------------------');
+  lines.push('※ このメールは自動送信です。送信後の回答の修正はできません。');
+
+  MailApp.sendEmail({
+    to: email,
+    subject: '【回答控え】' + form.getTitle(),
+    body: lines.join('\n')
+  });
 }
 
 /** revision競合リトライ付きで回答記録テーブルへ追記する */

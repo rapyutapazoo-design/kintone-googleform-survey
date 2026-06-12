@@ -16,6 +16,7 @@
 
     // 【変更不要】GASが事前入力URLに埋め込むプレースホルダ（GAS側の定数と対応）
     var USER_CODE_PLACEHOLDER = '__USERCODE__';
+    var EMAIL_PLACEHOLDER = '__USEREMAIL__';
 
     // 一般ユーザーに非表示にする管理用フィールド
     var ADMIN_FIELDS = ['form_url_base', 'form_id', 'entry_id', 'answer_log'];
@@ -118,13 +119,19 @@
         });
     }
 
-    /** 事前入力URLにユーザーコードを埋め込む */
+    /** 事前入力URLにユーザーコードと控え送信先メールアドレスを埋め込む */
     function buildFormUrl(urlTemplate, userCode) {
         if (!urlTemplate) return '';
-        if (urlTemplate.indexOf(USER_CODE_PLACEHOLDER) !== -1) {
-            return urlTemplate.replace(USER_CODE_PLACEHOLDER, encodeURIComponent(userCode));
+        var url = urlTemplate;
+        if (url.indexOf(USER_CODE_PLACEHOLDER) !== -1) {
+            url = url.replace(USER_CODE_PLACEHOLDER, encodeURIComponent(userCode));
         }
-        return urlTemplate; // プレースホルダなし（手動登録URL等）はそのまま
+        if (url.indexOf(EMAIL_PLACEHOLDER) !== -1) {
+            // Kintoneユーザー情報の登録アドレスを自動入力（未登録なら空欄＝任意入力にフォールバック）
+            var email = (kintone.getLoginUser().email || '');
+            url = url.replace(EMAIL_PLACEHOLDER, encodeURIComponent(email));
+        }
+        return url; // プレースホルダなし（手動登録URL等）はそのまま
     }
 
     // ============================================================
