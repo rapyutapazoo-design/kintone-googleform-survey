@@ -66,6 +66,9 @@ function registerNewForms(config) {
 
   while (files.hasNext()) {
     var file = files.next();
+    // ゴミ箱内のファイルはフォルダの子要素として返ってくるため明示的に除外する。
+    // （これがないと「フォーム削除＋レコード削除」後に再登録されてしまう）
+    if (file.isTrashed()) continue;
     var formId = file.getId();
     if (registered[formId]) continue;
     if (file.getName().indexOf(MASTER_PREFIX) === 0) continue; // マスターは除外
