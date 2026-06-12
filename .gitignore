@@ -1,0 +1,9 @@
+# 自環境の設定値控え（コミット禁止）
+docs/env.local.md
+
+# 実環境適用版コード（実値入り・コミット禁止）
+local/
+
+# OS生成物
+.DS_Store
+Thumbs.db
