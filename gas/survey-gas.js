@@ -1,5 +1,5 @@
 // ============================================================
-// アンケート自動化 常設GAS（1本・触らない運用）
+// アンケート自動化 常設GAS（1本）
 // ============================================================
 // 【構成】
 //   - watchFolder()   : 5分おきの時間トリガーで実行（手動で1回設置）
@@ -7,22 +7,32 @@
 //       ② 受付中フォームの回答取りこぼし補修（差分同期）
 //       ③ ステータス「終了」検知 → フォーム受付停止 + 送信トリガー削除
 //   - onFormSubmit(e) : フォーム送信時に即時実行（watchFolderが自動設置）
-//       回答者コード + 日時を Kintone の回答記録テーブルへ追記
+//       部屋番号 + 氏名 + 経路 + 日時 を Kintone の回答記録テーブルへ追記
+//   - doGet(e)        : QR用の中継ページ（Webアプリ）
+//       部屋番号・氏名を入力 → 回答済み照合 → 未回答ならフォームへ転送/回答済みならブロック
+//
+// 【名寄せ単位】個人ごとに1回（キー = 部屋番号 + 正規化した氏名）
 //
 // 【初期設定】スクリプトプロパティに以下を設定すること
-//   SURVEY_APP_ID  : アンケート管理アプリ（47）のID
-//   API_TOKEN      : アプリ47のAPIトークン（閲覧 + 編集 + 追加）
+//   SURVEY_APP_ID  : アンケート管理アプリのID
+//   API_TOKEN      : 管理アプリのAPIトークン（閲覧 + 編集 + 追加）
 //   SUBDOMAIN      : Kintoneサブドメイン（https://〇〇.cybozu.com の 〇〇 部分）
 //   FORM_FOLDER_ID : 監視対象のGoogle DriveフォルダID
 //
-// Webアプリとしてのデプロイは不要。Webhookも使用しない。
+// 【デプロイ】QR中継ページ(doGet)のため、ウェブアプリとしてデプロイが必要
+//   （実行ユーザー: 自分 / アクセス: 全員）。Webhookは使用しない。
 // ============================================================
 
-// ---- 定数 ----
-var USER_ID_QUESTION_TITLE = 'ユーザーID（変更しないでください）';
-var USER_CODE_PLACEHOLDER = '__USERCODE__';
+// ---- 質問タイトルと事前入力プレースホルダ ----
+var ROOM_QUESTION_TITLE  = '部屋番号';
+var ROOM_PLACEHOLDER     = '__ROOMNO__';
+var NAME_QUESTION_TITLE  = '氏名';
+var NAME_PLACEHOLDER     = '__USERNAME__';
+var ROUTE_QUESTION_TITLE = '回答経路（変更しないでください）';
+var ROUTE_PLACEHOLDER    = '__ROUTE__';
 var EMAIL_QUESTION_TITLE = 'メールアドレス（控えの送信先・任意）';
-var EMAIL_PLACEHOLDER = '__USEREMAIL__';
+var EMAIL_PLACEHOLDER    = '__USEREMAIL__';
+
 var MASTER_PREFIX = '[マスター]'; // この接頭辞のフォームは登録対象外
 
 // ---- 設定取得 ----
@@ -45,11 +55,7 @@ function getConfig() {
 // ============================================================
 function watchFolder() {
   var config = getConfig();
-
-  // --- ① 新フォームの検知・登録 ---
   registerNewForms(config);
-
-  // --- ② 受付中フォームの回答補修同期 + ③ 終了検知 ---
   syncAndClose(config);
 }
 
@@ -69,7 +75,6 @@ function registerNewForms(config) {
   while (files.hasNext()) {
     var file = files.next();
     // ゴミ箱内のファイルはフォルダの子要素として返ってくるため明示的に除外する。
-    // （これがないと「フォーム削除＋レコード削除」後に再登録されてしまう）
     if (file.isTrashed()) continue;
     var formId = file.getId();
     if (registered[formId]) continue;
@@ -88,37 +93,28 @@ function registerNewForms(config) {
 function setupForm(config, formId, formName) {
   var form = FormApp.openById(formId);
 
-  // --- フォーム設定 ---
   form.setAllowResponseEdits(false);    // 回答後の編集は常に不可
   form.setAcceptingResponses(true);
-  // 標準のメール収集は使わない（必須固定・事前入力不可のため）。
-  // 控えメールはonFormSubmitでGASが送信する。
   try { form.setCollectEmail(false); } catch (e) {
     console.warn('[setupForm] メール収集オフ設定に失敗: ' + e);
   }
 
-  // --- ユーザーID質問の追加（既存チェック付き） ---
-  var userIdItem = findItemByTitle(form, USER_ID_QUESTION_TITLE);
-  if (!userIdItem) {
-    userIdItem = form.addTextItem()
-      .setTitle(USER_ID_QUESTION_TITLE)
-      .setHelpText('自動入力されたIDです。回答の判定に使用するため、変更・削除しないでください。')
-      .setRequired(true);
-  }
-
-  // --- 控え送信先メールアドレス質問の追加（任意・既存チェック付き） ---
-  var emailItem = findItemByTitle(form, EMAIL_QUESTION_TITLE);
-  if (!emailItem) {
-    emailItem = form.addTextItem()
-      .setTitle(EMAIL_QUESTION_TITLE)
-      .setHelpText('回答の控えメールが不要な場合は空欄にしてください。'
-        + '控えが見当たらない場合は迷惑メールフォルダをご確認ください。')
-      .setRequired(false);
-  }
+  // --- システム質問の追加（既存チェック付き） ---
+  var roomItem = ensureTextItem(form, ROOM_QUESTION_TITLE,
+    'お住まいの部屋番号を入力してください。', true);
+  var nameItem = ensureTextItem(form, NAME_QUESTION_TITLE,
+    'お名前を入力してください。回答の重複防止に使用します。', true);
+  var routeItem = ensureTextItem(form, ROUTE_QUESTION_TITLE,
+    '自動入力された項目です。変更・削除しないでください。', false);
+  var emailItem = ensureTextItem(form, EMAIL_QUESTION_TITLE,
+    '回答の控えメールが不要な場合は空欄にしてください。'
+    + '控えが見当たらない場合は迷惑メールフォルダをご確認ください。', false);
 
   // --- 事前入力URL（プレースホルダ入り）の生成 ---
   var formResponse = form.createResponse();
-  formResponse.withItemResponse(userIdItem.asTextItem().createResponse(USER_CODE_PLACEHOLDER));
+  formResponse.withItemResponse(roomItem.asTextItem().createResponse(ROOM_PLACEHOLDER));
+  formResponse.withItemResponse(nameItem.asTextItem().createResponse(NAME_PLACEHOLDER));
+  formResponse.withItemResponse(routeItem.asTextItem().createResponse(ROUTE_PLACEHOLDER));
   formResponse.withItemResponse(emailItem.asTextItem().createResponse(EMAIL_PLACEHOLDER));
   var prefillUrl = formResponse.toPrefilledUrl();
   var entryId = extractEntryId(prefillUrl);
@@ -139,6 +135,15 @@ function setupForm(config, formId, formName) {
       status: { value: '作成中' }
     }
   });
+}
+
+/** タイトル一致でテキスト質問を取得（なければ作成） */
+function ensureTextItem(form, title, helpText, required) {
+  var item = findItemByTitle(form, title);
+  if (!item) {
+    item = form.addTextItem().setTitle(title).setHelpText(helpText).setRequired(required);
+  }
+  return item;
 }
 
 /** タイトル一致でテキスト質問を検索 */
@@ -163,6 +168,15 @@ function hasSubmitTrigger(formId) {
   });
 }
 
+/** 指定フォームの送信トリガーを削除 */
+function deleteSubmitTriggers(formId) {
+  ScriptApp.getProjectTriggers().forEach(function (t) {
+    if (t.getHandlerFunction() === 'onFormSubmit' && t.getTriggerSourceId() === formId) {
+      ScriptApp.deleteTrigger(t);
+    }
+  });
+}
+
 // ============================================================
 // ② 補修同期 + ③ 終了検知（watchFolderから呼び出し）
 // ============================================================
@@ -183,14 +197,12 @@ function syncAndClose(config) {
     }
 
     if (status === '受付中') {
-      // --- 取りこぼし補修: フォーム回答と回答記録テーブルの差分同期 ---
       try {
         repairAnswerLog(config, record, form);
       } catch (e) {
         console.error('[syncAndClose] 補修同期失敗: ' + formId + ' - ' + e);
       }
     } else if (status === '終了') {
-      // --- 受付の自動停止 + トリガー掃除 ---
       try {
         if (form.isAcceptingResponses()) {
           form.setAcceptingResponses(false);
@@ -204,28 +216,28 @@ function syncAndClose(config) {
   });
 }
 
-/** フォームの全回答からユーザーコードを抽出し、記録テーブルにない分を追記する */
+/** フォームの全回答から、記録テーブルにない分を追記する（部屋番号+氏名キー） */
 function repairAnswerLog(config, record, form) {
   var logged = {};
   var rows = (record.answer_log && record.answer_log.value) || [];
   rows.forEach(function (row) {
-    var u = row.value.ans_user ? row.value.ans_user.value : '';
-    if (u) logged[u] = true;
+    var k = answerKey(getRowVal(row, 'ans_room'), getRowVal(row, 'ans_name'));
+    if (k) logged[k] = true;
   });
 
   var missing = [];
   form.getResponses().forEach(function (resp) {
-    var code = extractUserCode(form, resp);
-    if (code && !logged[code]) {
-      logged[code] = true; // 同一ユーザーの複数回答は最初の1件のみ
-      missing.push({ user: code, time: resp.getTimestamp() });
-    }
+    var info = extractAnswerInfo(form, resp);
+    if (!info.key) return;
+    if (logged[info.key]) return;
+    logged[info.key] = true; // 同一個人の複数回答は最初の1件のみ
+    missing.push({ info: info, time: resp.getTimestamp() });
   });
 
   if (missing.length === 0) return;
 
   missing.forEach(function (m) {
-    rows.push(buildLogRow(m.user, m.time));
+    rows.push(buildLogRow(m.info, m.time));
   });
   updateAnswerLog(config, record.$id.value, rows);
   console.log('[repairAnswerLog] 補修 ' + missing.length + '件: record=' + record.$id.value);
@@ -239,35 +251,38 @@ function onFormSubmit(e) {
     var config = getConfig();
     var form = e.source;
     var formId = form.getId();
-    var userCode = extractUserCode(form, e.response);
+    var info = extractAnswerInfo(form, e.response);
 
-    if (!userCode) {
-      console.error('[onFormSubmit] ユーザーIDが取得できません: form=' + formId);
+    if (!info.key) {
+      console.error('[onFormSubmit] 部屋番号/氏名が取得できません: form=' + formId);
       return;
     }
 
-    // form_id からレコードを特定
     var records = fetchAllRecords(config, '$id, answer_log', 'form_id = "' + formId + '"');
     if (records.length === 0) {
       console.error('[onFormSubmit] 対応レコードなし: form=' + formId);
       return;
     }
-    var record = records[0];
 
-    // 競合に備えてリトライ付きで追記
-    appendAnswerWithRetry(config, record.$id.value, userCode, e.response.getTimestamp());
-    console.log('[onFormSubmit] 記録完了: ' + userCode + ' (form=' + formId + ')');
+    appendAnswerWithRetry(config, records[0].$id.value, info, e.response.getTimestamp());
+    console.log('[onFormSubmit] 記録完了: ' + info.key + ' route=' + info.route + ' (form=' + formId + ')');
 
-    // 控えメール送信（記録が主・メールが従。失敗しても記録には影響させない）
     try {
       sendCopyEmail(form, e.response);
     } catch (mailErr) {
       console.error('[onFormSubmit] 控えメール送信失敗: ' + mailErr);
     }
   } catch (err) {
-    // 失敗しても watchFolder の補修同期が5分以内にリカバリする
     console.error('[onFormSubmit] Error: ' + err + '\n' + (err.stack || ''));
   }
+}
+
+/** 回答から部屋番号・氏名・経路・名寄せキーを抽出 */
+function extractAnswerInfo(form, formResponse) {
+  var room = extractItemValue(form, formResponse, ROOM_QUESTION_TITLE);
+  var name = extractItemValue(form, formResponse, NAME_QUESTION_TITLE);
+  var route = extractItemValue(form, formResponse, ROUTE_QUESTION_TITLE) || 'QR';
+  return { room: room, name: name, route: route, key: answerKey(room, name) };
 }
 
 /** 回答から指定タイトルのテキスト質問の値を抽出 */
@@ -278,26 +293,156 @@ function extractItemValue(form, formResponse, title) {
   return itemResponse ? String(itemResponse.getResponse()).trim() : '';
 }
 
-/** 回答からユーザーID質問の値を抽出 */
-function extractUserCode(form, formResponse) {
-  return extractItemValue(form, formResponse, USER_ID_QUESTION_TITLE);
+/** 氏名・部屋番号の正規化（空白除去 + 全半角統一）。両方揃って初めてキー成立 */
+function normalizeKeyPart(s) {
+  return String(s || '').replace(/\s+/g, '').normalize('NFKC');
+}
+function answerKey(room, name) {
+  var r = normalizeKeyPart(room);
+  var n = normalizeKeyPart(name);
+  if (!r || !n) return '';
+  return r + '|' + n;
 }
 
 // ============================================================
-// 控えメール送信（onFormSubmitから呼び出し）
+// QR中継ページ（Webアプリ）
 // ============================================================
+function doGet(e) {
+  var params = (e && e.parameter) || {};
+  var fid = params.fid || '';
+  if (!fid) return htmlPage('エラー', '<p>アンケートが指定されていません。</p>');
 
-/**
- * メールアドレス質問に入力があれば、回答の控えメールを送信する。
- * 送信失敗しても回答記録には影響させない（呼び出し側でtry-catch分離）。
- */
+  var config = getConfig();
+  var records = fetchAllRecords(config,
+    '$id, survey_title, status, form_url_base, answer_log', 'form_id = "' + fid + '"');
+  if (records.length === 0) {
+    return htmlPage('エラー', '<p>アンケートが見つかりません。掲示のQRコードをご確認ください。</p>');
+  }
+  var record = records[0];
+  var title = record.survey_title ? record.survey_title.value : 'アンケート';
+  var status = record.status ? record.status.value : '';
+
+  if (status !== '受付中') {
+    var msg = (status === '終了')
+      ? 'このアンケートは受付を終了しました。ご協力ありがとうございました。'
+      : 'このアンケートはまだ受付を開始していません。しばらくお待ちください。';
+    return htmlPage(title, '<p>' + escapeHtml(msg) + '</p>');
+  }
+
+  var room = (params.room || '').trim();
+  var name = (params.name || '').trim();
+
+  // 部屋番号・氏名の入力がまだ → 入力ページを表示
+  if (!room || !name) {
+    return renderInputPage(fid, title, '');
+  }
+
+  // 回答済み照合
+  var key = answerKey(room, name);
+  var answered = false;
+  var rows = (record.answer_log && record.answer_log.value) || [];
+  rows.forEach(function (row) {
+    if (answerKey(getRowVal(row, 'ans_room'), getRowVal(row, 'ans_name')) === key) answered = true;
+  });
+
+  if (answered) {
+    return htmlPage(title,
+      '<div class="done">✅ すでに回答済みです</div>'
+      + '<p>この部屋番号・お名前での回答はすでに受け付けています。'
+      + 'ご協力ありがとうございました。</p>');
+  }
+
+  // 未回答 → フォームURLを生成して転送
+  var formUrl = buildPrefilledUrl(record.form_url_base ? record.form_url_base.value : '', room, name, 'QR', '');
+  if (!formUrl) {
+    return htmlPage(title, '<p>フォームの準備中です。しばらくしてからお試しください。</p>');
+  }
+  return redirectPage(formUrl);
+}
+
+/** 中継ページの form_url_base にQR回答者の値を埋め込む */
+function buildPrefilledUrl(template, room, name, route, email) {
+  if (!template) return '';
+  return template
+    .replace(ROOM_PLACEHOLDER, encodeURIComponent(room))
+    .replace(NAME_PLACEHOLDER, encodeURIComponent(name))
+    .replace(ROUTE_PLACEHOLDER, encodeURIComponent(route))
+    .replace(EMAIL_PLACEHOLDER, encodeURIComponent(email || ''));
+}
+
+/** 部屋番号・氏名の入力ページ */
+function renderInputPage(fid, title, errorMsg) {
+  var url = ScriptApp.getService().getUrl();
+  var err = errorMsg ? '<p class="err">' + escapeHtml(errorMsg) + '</p>' : '';
+  var body =
+    '<h2>' + escapeHtml(title) + '</h2>'
+    + '<p>回答の前に、お住まいの部屋番号とお名前をご入力ください。<br>'
+    + '（回答の重複を防ぐために使用します）</p>'
+    + err
+    + '<form method="get" action="' + url + '">'
+    + '<input type="hidden" name="fid" value="' + escapeHtml(fid) + '">'
+    + '<label>部屋番号<br><input type="text" name="room" required inputmode="numeric"></label>'
+    + '<label>氏名<br><input type="text" name="name" required></label>'
+    + '<button type="submit">アンケートに進む</button>'
+    + '</form>';
+  return htmlPage(title, body);
+}
+
+/** 指定URLへ自動転送するページ */
+function redirectPage(formUrl) {
+  var safe = JSON.stringify(formUrl);
+  var html = '<!DOCTYPE html><html lang="ja"><head><meta charset="UTF-8">'
+    + '<meta name="viewport" content="width=device-width,initial-scale=1">'
+    + '<title>アンケートへ移動します</title></head><body style="font-family:sans-serif;text-align:center;padding:40px">'
+    + '<p>アンケート画面へ移動します...</p>'
+    + '<p><a href=' + safe + '>自動で移動しない場合はこちら</a></p>'
+    + '<script>location.href=' + safe + ';</script>'
+    + '</body></html>';
+  return HtmlService.createHtmlOutput(html)
+    .addMetaTag('viewport', 'width=device-width, initial-scale=1')
+    .setXFrameOptionsMode(HtmlService.XFrameOptionsMode.ALLOWALL);
+}
+
+/** 共通HTMLページ */
+function htmlPage(title, bodyHtml) {
+  var html = '<!DOCTYPE html><html lang="ja"><head><meta charset="UTF-8">'
+    + '<meta name="viewport" content="width=device-width,initial-scale=1">'
+    + '<title>' + escapeHtml(title) + '</title><style>'
+    + 'body{font-family:"Helvetica Neue",Arial,sans-serif;background:#f4f6f9;margin:0;padding:24px;color:#333}'
+    + '.card{background:#fff;max-width:480px;margin:0 auto;border-radius:16px;padding:28px;box-shadow:0 4px 16px rgba(0,0,0,.1)}'
+    + 'h2{font-size:18px;margin:0 0 16px}label{display:block;margin:14px 0;font-weight:bold;font-size:14px}'
+    + 'input{width:100%;box-sizing:border-box;padding:12px;margin-top:6px;border:1px solid #ccc;border-radius:8px;font-size:16px}'
+    + 'button{width:100%;margin-top:20px;padding:14px;border:none;border-radius:50px;'
+    + 'background:linear-gradient(135deg,#6c3483,#8e44ad);color:#fff;font-size:16px;font-weight:bold;cursor:pointer}'
+    + '.done{font-size:20px;font-weight:bold;color:#0ba360;text-align:center;margin-bottom:12px}'
+    + '.err{color:#e74c3c;font-weight:bold}p{line-height:1.7;font-size:14px}'
+    + '</style></head><body><div class="card">' + bodyHtml + '</div></body></html>';
+  return HtmlService.createHtmlOutput(html)
+    .addMetaTag('viewport', 'width=device-width, initial-scale=1');
+}
+
+function escapeHtml(s) {
+  return String(s || '').replace(/[&<>"']/g, function (c) {
+    return { '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c];
+  });
+}
+
+// ============================================================
+// 控えメール送信
+// ============================================================
 function sendCopyEmail(form, formResponse) {
   var email = extractItemValue(form, formResponse, EMAIL_QUESTION_TITLE);
-  if (!email) return; // 空欄＝控え不要（任意のため）
+  if (!email) return;
   if (email.indexOf('@') === -1) {
     console.warn('[sendCopyEmail] メールアドレスとして不正なためスキップ: ' + email);
     return;
   }
+
+  var systemTitles = {};
+  systemTitles[ROOM_QUESTION_TITLE] = 1;
+  systemTitles[NAME_QUESTION_TITLE] = 1;
+  systemTitles[ROUTE_QUESTION_TITLE] = 1;
+  systemTitles[EMAIL_QUESTION_TITLE] = 1;
 
   var lines = [];
   lines.push('このたびはアンケートにご回答いただき、ありがとうございました。');
@@ -310,8 +455,7 @@ function sendCopyEmail(form, formResponse) {
 
   formResponse.getItemResponses().forEach(function (itemResponse) {
     var title = itemResponse.getItem().getTitle();
-    // システム用の質問は控えに含めない
-    if (title === USER_ID_QUESTION_TITLE || title === EMAIL_QUESTION_TITLE) return;
+    if (systemTitles[title]) return; // システム質問は控えに含めない
     var answer = itemResponse.getResponse();
     if (Array.isArray(answer)) answer = answer.join('、');
     lines.push('【' + title + '】');
@@ -329,8 +473,12 @@ function sendCopyEmail(form, formResponse) {
   });
 }
 
-/** revision競合リトライ付きで回答記録テーブルへ追記する */
-function appendAnswerWithRetry(config, recordId, userCode, timestamp) {
+// ============================================================
+// 回答記録テーブルの読み書き
+// ============================================================
+
+/** revision競合リトライ付きで回答記録テーブルへ追記する（部屋番号+氏名キー） */
+function appendAnswerWithRetry(config, recordId, info, timestamp) {
   var maxRetry = 3;
   for (var attempt = 1; attempt <= maxRetry; attempt++) {
     try {
@@ -340,13 +488,12 @@ function appendAnswerWithRetry(config, recordId, userCode, timestamp) {
       var revision = record.$revision.value;
       var rows = (record.answer_log && record.answer_log.value) || [];
 
-      // 既に記録済みならスキップ（重複防止）
       var exists = rows.some(function (row) {
-        return row.value.ans_user && row.value.ans_user.value === userCode;
+        return answerKey(getRowVal(row, 'ans_room'), getRowVal(row, 'ans_name')) === info.key;
       });
-      if (exists) return;
+      if (exists) return; // 既に記録済み
 
-      rows.push(buildLogRow(userCode, timestamp));
+      rows.push(buildLogRow(info, timestamp));
 
       kintoneRequest(config, 'PUT', '/k/v1/record.json', {
         app: config.appId,
@@ -354,7 +501,7 @@ function appendAnswerWithRetry(config, recordId, userCode, timestamp) {
         revision: revision,
         record: { answer_log: { value: rows } }
       });
-      return; // 成功
+      return;
     } catch (err) {
       if (attempt === maxRetry) throw err;
       console.warn('[appendAnswerWithRetry] リトライ ' + attempt + '/' + maxRetry + ': ' + err);
@@ -363,21 +510,24 @@ function appendAnswerWithRetry(config, recordId, userCode, timestamp) {
   }
 }
 
-// ============================================================
-// 共通ヘルパー
-// ============================================================
-
 /** 回答記録テーブルの1行を生成 */
-function buildLogRow(userCode, timestamp) {
+function buildLogRow(info, timestamp) {
   var iso = Utilities.formatDate(
     timestamp instanceof Date ? timestamp : new Date(),
     'Asia/Tokyo', "yyyy-MM-dd'T'HH:mm:ssXXX");
   return {
     value: {
-      ans_user: { value: userCode },
+      ans_room: { value: info.room },
+      ans_name: { value: info.name },
+      ans_route: { value: info.route },
       ans_time: { value: iso }
     }
   };
+}
+
+/** テーブル行からサブフィールド値を安全に取得 */
+function getRowVal(row, code) {
+  return (row.value && row.value[code]) ? row.value[code].value : '';
 }
 
 /** 回答記録テーブルを丸ごと更新（補修同期用・単一プロセス前提） */
@@ -389,7 +539,11 @@ function updateAnswerLog(config, recordId, rows) {
   });
 }
 
-/** アプリ47のレコードを全件取得（500件ずつページング） */
+// ============================================================
+// Kintone REST API
+// ============================================================
+
+/** 管理アプリのレコードを全件取得（500件ずつページング） */
 function fetchAllRecords(config, fields, condition) {
   var all = [];
   var offset = 0;
@@ -448,15 +602,11 @@ function kintoneRequest(config, method, path, payload) {
 // ============================================================
 // 手動テスト用
 // ============================================================
+function testWatchFolder() { watchFolder(); }
 
-/** 手動実行: フォルダ監視を1回実行してログを確認する */
-function testWatchFolder() {
-  watchFolder();
-}
-
-/** 手動実行: 設定値の確認 */
 function testConfig() {
   var c = getConfig();
   console.log('appId=' + c.appId + ' subdomain=' + c.subdomain + ' folderId=' + c.folderId);
   console.log('token=' + (c.token ? '設定済み(' + c.token.length + '文字)' : '未設定'));
+  console.log('webAppUrl=' + (ScriptApp.getService().getUrl() || '（未デプロイ）'));
 }

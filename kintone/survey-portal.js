@@ -15,7 +15,9 @@
     var MOBILE_VIEW_NAME = 'スマホ版簡易一覧';
 
     // 【変更不要】GASが事前入力URLに埋め込むプレースホルダ（GAS側の定数と対応）
-    var USER_CODE_PLACEHOLDER = '__USERCODE__';
+    var ROOM_PLACEHOLDER = '__ROOMNO__';
+    var NAME_PLACEHOLDER = '__USERNAME__';
+    var ROUTE_PLACEHOLDER = '__ROUTE__';
     var EMAIL_PLACEHOLDER = '__USEREMAIL__';
 
     // 一般ユーザーに非表示にする管理用フィールド
@@ -110,28 +112,43 @@
         return map;
     }
 
-    /** 回答記録テーブルにログインユーザーのコードがあるか */
+    /** 氏名・部屋番号の正規化（GAS側 normalizeKeyPart と一致させること） */
+    function normalizeKeyPart(s) {
+        var str = String(s || '').replace(/\s+/g, '');
+        return str.normalize ? str.normalize('NFKC') : str;
+    }
+    function answerKey(room, name) {
+        var r = normalizeKeyPart(room);
+        var n = normalizeKeyPart(name);
+        if (!r || !n) return '';
+        return r + '|' + n;
+    }
+
+    /** ログインユーザーの部屋番号（従業員ID）と氏名 */
+    function myRoom() { return kintone.getLoginUser().employeeNumber || ''; }
+    function myName() { return kintone.getLoginUser().name || ''; }
+
+    /** 回答記録テーブルにログインユーザー（部屋番号＋氏名）の回答があるか */
     function isUserAnswered(answerLogField) {
         if (!answerLogField || !answerLogField.value) return false;
-        var myCode = kintone.getLoginUser().code;
+        var myKey = answerKey(myRoom(), myName());
+        if (!myKey) return false;
         return answerLogField.value.some(function (row) {
-            return row.value.ans_user && row.value.ans_user.value === myCode;
+            var room = row.value.ans_room ? row.value.ans_room.value : '';
+            var name = row.value.ans_name ? row.value.ans_name.value : '';
+            return answerKey(room, name) === myKey;
         });
     }
 
-    /** 事前入力URLにユーザーコードと控え送信先メールアドレスを埋め込む */
-    function buildFormUrl(urlTemplate, userCode) {
+    /** 事前入力URLに部屋番号・氏名・経路・控えメールを埋め込む（Kintone導線） */
+    function buildFormUrl(urlTemplate) {
         if (!urlTemplate) return '';
-        var url = urlTemplate;
-        if (url.indexOf(USER_CODE_PLACEHOLDER) !== -1) {
-            url = url.replace(USER_CODE_PLACEHOLDER, encodeURIComponent(userCode));
-        }
-        if (url.indexOf(EMAIL_PLACEHOLDER) !== -1) {
-            // Kintoneユーザー情報の登録アドレスを自動入力（未登録なら空欄＝任意入力にフォールバック）
-            var email = (kintone.getLoginUser().email || '');
-            url = url.replace(EMAIL_PLACEHOLDER, encodeURIComponent(email));
-        }
-        return url; // プレースホルダなし（手動登録URL等）はそのまま
+        var user = kintone.getLoginUser();
+        return urlTemplate
+            .replace(ROOM_PLACEHOLDER, encodeURIComponent(user.employeeNumber || ''))
+            .replace(NAME_PLACEHOLDER, encodeURIComponent(user.name || ''))
+            .replace(ROUTE_PLACEHOLDER, encodeURIComponent('Kintone'))
+            .replace(EMAIL_PLACEHOLDER, encodeURIComponent(user.email || ''));
     }
 
     // ============================================================
@@ -179,7 +196,7 @@
             btn.style.cssText = BTN_BASE + BG_PURPLE + 'cursor:pointer;';
             btn.innerHTML = '📝 アンケートに回答する';
 
-            var formUrl = buildFormUrl(info.url, userCode);
+            var formUrl = buildFormUrl(info.url);
             btn.onclick = function (e) {
                 e.stopPropagation();
                 if (isMobile) {
@@ -270,7 +287,7 @@
             + '<span style="display:inline-flex;background:linear-gradient(135deg,#6c3483,#8e44ad);'
             + 'color:#fff;border-radius:20px;padding:2px 10px;font-weight:bold;font-size:11px;'
             + 'vertical-align:middle">📝 アンケートに回答する</span>'
-            + ' ボタンをタップしてください。フォーム内のユーザーIDは変更しないでください。</div>'
+            + ' ボタンをタップしてください。部屋番号・氏名は自動入力されます（変更しないでください）。</div>'
             + '<div style="margin-bottom:10px">'
             + '<strong>② 回答の控え</strong><br>'
             + 'フォームでメールアドレスを入力すると、回答のコピーがメールで届きます。'
