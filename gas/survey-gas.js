@@ -26,8 +26,12 @@
 // ---- 質問タイトルと事前入力プレースホルダ ----
 var ROOM_QUESTION_TITLE  = '部屋番号';
 var ROOM_PLACEHOLDER     = '__ROOMNO__';
-var NAME_QUESTION_TITLE  = '氏名';
+var NAME_QUESTION_TITLE  = '氏名またはユーザーネーム';
 var NAME_PLACEHOLDER     = '__USERNAME__';
+// 氏名欄の案内（フォーム設問・QR中継ページで共通利用）
+var NAME_HELP_TEXT = 'Kintoneアカウントをお持ちの方は、Kintoneに表示される'
+  + 'ユーザーネームを入力してください。お持ちでない方はお名前をご入力ください。'
+  + '回答の重複防止に使用します。';
 var ROUTE_QUESTION_TITLE = '回答経路（変更しないでください）';
 var ROUTE_PLACEHOLDER    = '__ROUTE__';
 var EMAIL_QUESTION_TITLE = 'メールアドレス（控えの送信先・任意）';
@@ -102,8 +106,7 @@ function setupForm(config, formId, formName) {
   // --- システム質問の追加（既存チェック付き） ---
   var roomItem = ensureTextItem(form, ROOM_QUESTION_TITLE,
     'お住まいの部屋番号を入力してください。', true);
-  var nameItem = ensureTextItem(form, NAME_QUESTION_TITLE,
-    'お名前を入力してください。回答の重複防止に使用します。', true);
+  var nameItem = ensureTextItem(form, NAME_QUESTION_TITLE, NAME_HELP_TEXT, true);
   var routeItem = ensureTextItem(form, ROUTE_QUESTION_TITLE,
     '自動入力された項目です。変更・削除しないでください。', false);
   var emailItem = ensureTextItem(form, EMAIL_QUESTION_TITLE,
@@ -382,7 +385,9 @@ function renderInputPage(fid, title, errorMsg) {
     + '<form method="get" action="' + url + '">'
     + '<input type="hidden" name="fid" value="' + escapeHtml(fid) + '">'
     + '<label>部屋番号<br><input type="text" name="room" required inputmode="numeric"></label>'
-    + '<label>氏名<br><input type="text" name="name" required></label>'
+    + '<label>氏名またはユーザーネーム<br><input type="text" name="name" required></label>'
+    + '<p class="note">Kintoneアカウントをお持ちの方は、Kintoneに表示される'
+    + 'ユーザーネームを入力してください。お持ちでない方はお名前をご入力ください。</p>'
     + '<button type="submit">アンケートに進む</button>'
     + '</form>';
   return htmlPage(title, body);
@@ -416,6 +421,7 @@ function htmlPage(title, bodyHtml) {
     + 'background:linear-gradient(135deg,#6c3483,#8e44ad);color:#fff;font-size:16px;font-weight:bold;cursor:pointer}'
     + '.done{font-size:20px;font-weight:bold;color:#0ba360;text-align:center;margin-bottom:12px}'
     + '.err{color:#e74c3c;font-weight:bold}p{line-height:1.7;font-size:14px}'
+    + '.note{font-size:12px;color:#666;margin-top:8px}'
     + '</style></head><body><div class="card">' + bodyHtml + '</div></body></html>';
   return HtmlService.createHtmlOutput(html)
     .addMetaTag('viewport', 'width=device-width, initial-scale=1');
