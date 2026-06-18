@@ -4,6 +4,9 @@ docs/env.local.md
 # 実環境適用版コード（実値入り・コミット禁止）
 local/
 
+# 生成したQRコード（実デプロイURL・フォームIDを含むため非公開）
+qr/
+
 # OS生成物
 .DS_Store
 Thumbs.db
