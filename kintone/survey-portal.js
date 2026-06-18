@@ -21,7 +21,7 @@
     var EMAIL_PLACEHOLDER = '__USEREMAIL__';
 
     // 一般ユーザーに非表示にする管理用フィールド
-    var ADMIN_FIELDS = ['form_url_base', 'form_id', 'entry_id', 'answer_log'];
+    var ADMIN_FIELDS = ['form_url_base', 'form_qr_url', 'form_id', 'entry_id', 'answer_log'];
 
     // ============================================================
     // デザイン定数
